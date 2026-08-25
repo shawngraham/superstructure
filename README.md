@@ -9,9 +9,8 @@ Supernote devices are a pleasure to work on, easy on the eyes, low-powered, resi
 4. Move the note to your computer.
 5. Make sure the parser script knows the area of the bounding boxes by using the `visualize-rois.py` script. This will let you drag and drop the areas visually on the template; it will return the coordinates properly scaled for the device you use (manta or nomad). Copy that data into the parse scripts.
 6. `parse_context_record.py` lets you use ocrmac, rapidocr, or a vlm.
-7. `qwen_direct.py` downloads and uses a local vlm to try to read the whole thing
-8. `rtr-parse.py` retrieves the on-device OCR and the bounding boxes, then uses a VLM to 'correct' errors.
+7. `parse_hybrid_record.py` retrieves the on-device OCR and the bounding boxes, then uses a VLM to 'correct' errors. **This one currently gives the best results**.
 
-**A work in progress**. Developed on a mac m1. `rtr-parse.py` uses mlx, so you'd have to faff about if you wanted a windows/linux solution; if you're on windows, the `parse_context_record.py` and `qwen_direct.py` should probably work for you.
+**A work in progress**. Developed on a mac m1. `parse_hybrid_record.py` uses mlx, so you'd have to faff about if you wanted a windows/linux solution; if you're on windows, the `parse_context_record.py` script should probably work for you. But the best idea would be to modify the strategy used by parse_hybrid_record.py to work on windows.
 
 You could always plumb those scripts into a high-end vlm if you want; that should probably give you best results. Anyway, this general approach should work for any kind of form filling you might want to do on a Supernote. 

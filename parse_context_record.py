@@ -2,31 +2,29 @@
 """
 parse_context_record.py
 ───────────────────────
-Parses a completed Supernote .note file of the archaeological Context Record
-form. Rasterises the note to a PNG, crops each form field's region of
-interest, runs OCR on each crop, and outputs structured data as JSON and CSV.
+Parses a completed Supernote .note file (or rasterised PNG) of the
+archaeological Context Record form. Rasterises the note to a PIL Image,
+crops each form field's region of interest, runs OCR on each crop, and
+outputs structured data as JSON and/or CSV.
 
 Supported OCR engines  (select with --engine)
 ---------------------------------------------
-  ocrmac     Apple Vision framework. macOS only. Best choice on Mac.
+  ocrmac     Apple Vision framework. macOS only. Best default on Mac.
              pip install ocrmac
 
   rapidocr   RapidOCR via ONNX Runtime. Cross-platform (Linux/Windows/Mac).
-             Same model quality as PaddleOCR without requiring PaddlePaddle.
              pip install rapidocr onnxruntime
 
-  qwen       Qwen2.5-VL vision-language model running fully locally.
-             Best handwriting accuracy; requires ~8 GB RAM for the 3B model,
-             ~16 GB for 7B. Model is downloaded from HuggingFace on first run
-             and cached locally — no data leaves the machine after that.
+  qwen       Qwen2.5-VL vision-language model, fully local.
+             Best handwriting accuracy; ~8 GB RAM for 3B, ~16 GB for 7B.
              pip install git+https://github.com/huggingface/transformers
              pip install torch accelerate qwen-vl-utils
 
 Platform guidance
 -----------------
-  macOS (Apple Silicon)  →  --engine ocrmac   (default if ocrmac importable)
+  macOS (Apple Silicon)  →  --engine ocrmac   (auto-detected)
                              --engine qwen     (better accuracy, slower)
-  Linux / Windows        →  --engine rapidocr (default on non-Mac)
+  Linux / Windows        →  --engine rapidocr  (auto-detected)
                              --engine qwen     (better accuracy, needs RAM)
 
 Usage
@@ -41,21 +39,18 @@ Usage
 
 Output
 ------
-  context_001.json            one JSON object per form
-  context_records_batch.csv   appended CSV row (shared across batch runs)
+  context_001.json             — one JSON object per form
+  context_records_batch.csv    — appended CSV row (shared across batch runs)
 
-Notes on field regions
-----------------------
-All ROI coordinates are fractional (0.0–1.0) of the canvas:
-  Nomad: 1404 × 1872 px    Manta: 1920 × 2560 px
-Tune FIELD_REGIONS below if crops are misaligned; use --debug-crops to inspect.
+Requires context_record_schema.py in the same directory.
 """
 
 import argparse
 import csv
+import io
 import json
-import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -64,91 +59,101 @@ from typing import Optional
 
 from PIL import Image
 
-# ── Supernote canvas dimensions ───────────────────────────────────────────────
-CANVAS = {
-    "nomad": (1404, 1872),
-    "manta": (1920, 2560),
-}
+# ── Shared schema ─────────────────────────────────────────────────────────────
+try:
+    from context_record_schema import (
+        CANVAS, FIELD_REGIONS, OUTPUT_FIELDS, CHECKBOX_HINTS, NUMERIC_FIELDS,
+        CSV_METADATA_KEYS, CSV_METADATA_LABELS, CSV_FIELD_KEYS, CSV_FIELD_LABELS,
+    )
+except ImportError:
+    print("ERROR: context_record_schema.py not found. Place it alongside this script.")
+    sys.exit(1)
 
 # ── Available engine names ────────────────────────────────────────────────────
 ENGINES = ["ocrmac", "rapidocr", "qwen"]
 
 # ── Qwen model size → HuggingFace repo ───────────────────────────────────────
 QWEN_MODELS = {
-    "3B": "Qwen/Qwen2.5-VL-3B-Instruct",
-    "7B": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "3B":  "Qwen/Qwen2.5-VL-3B-Instruct",
+    "7B":  "Qwen/Qwen2.5-VL-7B-Instruct",
     "72B": "Qwen/Qwen2.5-VL-72B-Instruct",
 }
 
-# ── Form field regions (fractional x0, y0, x1, y1) ───────────────────────────
-FIELD_REGIONS = {
-    "site_code":    {"label": "Site Code",                    "roi": (0.167, 0.077, 0.256, 0.092), "type": "text"},
-    "area":         {"label": "Area",                         "roi": (0.301, 0.077, 0.384, 0.092), "type": "text"},
-    "trench":       {"label": "Trench",                       "roi": (0.449, 0.077, 0.608, 0.092), "type": "text"},
-    "context":      {"label": "Context",                      "roi": (0.684, 0.077, 0.949, 0.092), "type": "text"},
-    "date":         {"label": "Date",                         "roi": (0.117, 0.105, 0.380, 0.129), "type": "text"},
-    "recorded_by":  {"label": "Recorded by",                  "roi": (0.504, 0.105, 0.948, 0.129), "type": "text"},
-    "feature_type": {"label": "Feature Type",                 "roi": (0.281, 0.145, 0.744, 0.163), "type": "checkbox_group",
-                     "options": ["Deposit", "Cut", "Fill", "Structural"]},
-    "description":  {"label": "Description",                  "roi": (0.070, 0.172, 0.952, 0.496), "type": "text"},
-    "above":        {"label": "Above",                        "roi": (0.105, 0.501, 0.910, 0.525), "type": "text"},
-    "below":        {"label": "Below",                        "roi": (0.105, 0.568, 0.910, 0.593), "type": "text"},
-    "comments":     {"label": "Comments",                     "roi": (0.058, 0.604, 0.951, 0.793), "type": "text"},
-    "finds":        {"label": "Finds",                        "roi": (0.173, 0.807, 0.571, 0.827), "type": "checkbox_group",
-                     "options": ["Pot", "Lithic", "Bone", "Metal", "Other"]},
-    "small_finds":  {"label": "Small Finds",                  "roi": (0.171, 0.835, 0.934, 0.882), "type": "text"},
-    "samples":      {"label": "Samples",                      "roi": (0.152, 0.888, 0.947, 0.918), "type": "text"},
-    "plan":         {"label": "Plan",                         "roi": (0.115, 0.922, 0.239, 0.953), "type": "text"},
-    "section":      {"label": "Section",                      "roi": (0.312, 0.925, 0.501, 0.952), "type": "text"},
-    "photo":        {"label": "Photo",                        "roi": (0.559, 0.920, 0.946, 0.960), "type": "text"},
-}
+# ── numpy import (required by rapidocr) ──────────────────────────────────────
+try:
+    import numpy as np
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    _NUMPY_AVAILABLE = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rasterisation helpers
+# Image loading and cropping
 # ─────────────────────────────────────────────────────────────────────────────
 
-def rasterise_note(note_path: Path, device: str = "nomad") -> Image.Image:
+def rasterise_note(note_path: Path, device: str) -> Image.Image:
     """Convert a .note file to a PIL Image via supernote-tool."""
     try:
         import supernotelib  # noqa: F401
     except ImportError:
         raise ImportError("Run:  pip install supernotelib")
 
+    target = CANVAS[device]
+
     with tempfile.TemporaryDirectory() as tmp:
         out_png = Path(tmp) / "page.png"
+        last_result = None
+
         for cmd in (
             ["supernote-tool", "convert", str(note_path), str(out_png)],
-            [sys.executable, "-m", "supernotelib.cli", "convert", str(note_path), str(out_png)],
+            [sys.executable, "-m", "supernotelib.cli", "convert",
+             str(note_path), str(out_png)],
         ):
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode == 0 and out_png.exists():
-                break
+            try:
+                r = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=60
+                )
+                last_result = r
+                if r.returncode == 0 and out_png.exists():
+                    break
+            except FileNotFoundError:
+                continue
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    "supernote-tool timed out after 60 s. "
+                    "Check that the .note file is not corrupt."
+                )
         else:
+            stderr = last_result.stderr if last_result else "(command not found)"
             raise RuntimeError(
-                f"supernote-tool failed.\nSTDERR: {r.stderr}\n"
+                f"supernote-tool failed.\nSTDERR: {stderr}\n"
                 "Make sure supernotelib is installed:  pip install supernotelib"
             )
+
         img = Image.open(str(out_png)).convert("RGB")
 
-    tw, th = CANVAS[device]
-    if img.size != (tw, th):
-        img = img.resize((tw, th), Image.LANCZOS)
-    return img
-
-
-def load_image(path: Path, device: str = "nomad") -> Image.Image:
-    """Load a .note, .png, .jpg, etc. and return a PIL Image at canvas size."""
-    if path.suffix.lower() == ".note":
-        return rasterise_note(path, device)
-    img = Image.open(str(path)).convert("RGB")
-    target = CANVAS[device]
     if img.size != target:
+        print(f"WARNING: Rasterised image {img.size} differs from "
+              f"{device} canvas {target}. Resizing — ROI alignment may be affected.")
         img = img.resize(target, Image.LANCZOS)
     return img
 
 
-def crop_roi(img: Image.Image, roi: tuple, device: str = "nomad") -> Image.Image:
+def load_image(path: Path, device: str) -> Image.Image:
+    """Load a .note, .png, .jpg, etc. and return a PIL Image at canvas size."""
+    target = CANVAS[device]
+    if path.suffix.lower() == ".note":
+        return rasterise_note(path, device)
+    img = Image.open(str(path)).convert("RGB")
+    if img.size != target:
+        print(f"WARNING: Input image size {img.size} differs from "
+              f"{device} canvas {target}. Resizing — ROI alignment may be affected. "
+              f"Use --device to select the correct device model.")
+        img = img.resize(target, Image.LANCZOS)
+    return img
+
+
+def crop_roi(img: Image.Image, roi: tuple, device: str) -> Image.Image:
     """Crop a fractional ROI from the full canvas image."""
     w, h = CANVAS[device]
     x0, y0, x1, y1 = roi
@@ -160,13 +165,13 @@ def crop_roi(img: Image.Image, roi: tuple, device: str = "nomad") -> Image.Image
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ocr_ocrmac(crop: Image.Image) -> str:
-    """OCR via Apple Vision framework (macOS only). pip install ocrmac"""
+    """OCR via Apple Vision framework (macOS only)."""
     try:
         from ocrmac import ocrmac as _om
     except ImportError:
         raise ImportError(
             "ocrmac not installed.\nRun:  pip install ocrmac\n"
-            "(macOS only — use --engine rapidocr or --engine qwen on other platforms)"
+            "(macOS only — use --engine rapidocr or --engine qwen elsewhere)"
         )
     annotations = _om.OCR(
         crop,
@@ -180,14 +185,21 @@ def _ocr_ocrmac(crop: Image.Image) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Engine: rapidocr  (cross-platform ONNX, same models as PaddleOCR)
+# Engine: rapidocr  (cross-platform ONNX)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _RAPIDOCR_ENGINE = None
 
 def _ocr_rapidocr(crop: Image.Image) -> str:
-    """OCR via RapidOCR + ONNX Runtime. pip install rapidocr onnxruntime"""
+    """OCR via RapidOCR + ONNX Runtime."""
     global _RAPIDOCR_ENGINE
+
+    if not _NUMPY_AVAILABLE:
+        raise ImportError(
+            "numpy is required for rapidocr.\n"
+            "Run:  pip install numpy rapidocr onnxruntime"
+        )
+
     if _RAPIDOCR_ENGINE is None:
         try:
             from rapidocr import RapidOCR
@@ -198,10 +210,6 @@ def _ocr_rapidocr(crop: Image.Image) -> str:
             )
         _RAPIDOCR_ENGINE = RapidOCR()
 
-    import io
-    import numpy as np
-
-    # Round-trip through PNG to get a clean contiguous array
     buf = io.BytesIO()
     crop.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
@@ -220,9 +228,9 @@ def _ocr_rapidocr(crop: Image.Image) -> str:
 # Engine: qwen  (Qwen2.5-VL, fully local)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_QWEN_MODEL = None
+_QWEN_MODEL     = None
 _QWEN_PROCESSOR = None
-_QWEN_DEVICE = None
+_QWEN_DEVICE    = None
 
 OCR_PROMPT = (
     "This is a cropped region of a handwritten archaeological context record form. "
@@ -230,18 +238,9 @@ OCR_PROMPT = (
     "Return only the transcribed text — no commentary, no labels, no formatting."
 )
 
+
 def _ensure_qwen(model_size: str = "3B") -> None:
-    """
-    Download (first run) and load Qwen2.5-VL into memory.
-
-    Models are cached by HuggingFace in ~/.cache/huggingface/ after the first
-    download — no data leaves the machine during subsequent runs.
-
-    Model sizes and approximate requirements:
-      3B  — ~6 GB download,  ~8 GB RAM/VRAM   (good for laptops)
-      7B  — ~14 GB download, ~16 GB RAM/VRAM  (good for workstations)
-      72B — ~144 GB download, needs multiple GPUs or extreme RAM
-    """
+    """Download (first run only) and load Qwen2.5-VL into memory."""
     global _QWEN_MODEL, _QWEN_PROCESSOR, _QWEN_DEVICE
 
     if _QWEN_MODEL is not None:
@@ -264,7 +263,6 @@ def _ensure_qwen(model_size: str = "3B") -> None:
             "  pip install torch accelerate qwen-vl-utils"
         )
 
-    # Detect best available device
     if torch.cuda.is_available():
         _QWEN_DEVICE = "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -273,67 +271,43 @@ def _ensure_qwen(model_size: str = "3B") -> None:
         _QWEN_DEVICE = "cpu"
 
     dtype = torch.bfloat16 if _QWEN_DEVICE != "cpu" else torch.float32
-
-    print(f"[qwen] Loading {repo} on {_QWEN_DEVICE} ({dtype}) …")
-    print(f"[qwen] First run downloads the model to ~/.cache/huggingface/")
+    print(f"[qwen] Loading {repo} on {_QWEN_DEVICE} ({dtype}) ...")
+    print("[qwen] First run downloads the model to ~/.cache/huggingface/")
 
     _QWEN_MODEL = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        repo,
-        torch_dtype=dtype,
-        device_map="auto",
+        repo, torch_dtype=dtype, device_map="auto",
     )
     _QWEN_PROCESSOR = AutoProcessor.from_pretrained(repo)
-    print(f"[qwen] Model ready.")
+    print("[qwen] Model ready.")
 
 
 def _ocr_qwen(crop: Image.Image, model_size: str = "3B") -> str:
-    """
-    OCR via Qwen2.5-VL running fully locally.
-
-    The entire page crop is sent as a single image with a transcription prompt.
-    The model generates the handwritten text directly — no region detection
-    step needed since the VLM understands layout context.
-    """
+    """OCR via Qwen2.5-VL running fully locally."""
     import torch
     from qwen_vl_utils import process_vision_info
 
     _ensure_qwen(model_size)
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": crop},
-                {"type": "text",  "text": OCR_PROMPT},
-            ],
-        }
-    ]
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": crop},
+        {"type": "text",  "text": OCR_PROMPT},
+    ]}]
 
     text_input = _QWEN_PROCESSOR.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     image_inputs, video_inputs = process_vision_info(messages)
-
     inputs = _QWEN_PROCESSOR(
-        text=[text_input],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
+        text=[text_input], images=image_inputs, videos=video_inputs,
+        padding=True, return_tensors="pt",
     ).to(_QWEN_DEVICE)
 
     with torch.inference_mode():
         generated_ids = _QWEN_MODEL.generate(
-            **inputs,
-            max_new_tokens=256,
-            do_sample=False,
+            **inputs, max_new_tokens=256, do_sample=False,
         )
 
-    # Strip the input tokens from the output
-    trimmed = [
-        out[len(inp):]
-        for inp, out in zip(inputs.input_ids, generated_ids)
-    ]
+    trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
     decoded = _QWEN_PROCESSOR.batch_decode(
         trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )
@@ -356,73 +330,146 @@ def ocr_crop(crop: Image.Image, engine: str, qwen_model: str = "3B") -> str:
         raise ValueError(f"Unknown engine '{engine}'. Choose from: {ENGINES}")
 
 
-def detect_checkboxes(
+# ─────────────────────────────────────────────────────────────────────────────
+# Checkbox detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_checkboxes_by_column(
     crop: Image.Image,
     options: list,
     engine: str,
     qwen_model: str = "3B",
 ) -> list:
     """
-    Identify ticked checkboxes in a crop.
+    Identify ticked checkboxes by dividing the crop into per-option column slices.
 
-    For ocrmac/rapidocr: heuristic scan for tick characters near option labels.
-    For qwen: ask the model directly which boxes are ticked — more reliable.
+    For ocrmac / rapidocr:
+        The checkbox row is divided into N equal vertical slices, one per option.
+        OCR runs on each slice independently so tick characters can only be
+        attributed to their own option column — eliminating the proximity-window
+        ambiguity of the previous heuristic approach.
+
+    For qwen:
+        The full crop is sent with a structured prompt listing the options.
+        The model is instructed to express uncertainty by omitting ambiguous marks,
+        reducing false positives at the cost of occasional false negatives (the
+        correct trade-off for an archival record).
     """
     if engine == "qwen":
-        import torch
-        from qwen_vl_utils import process_vision_info
-
-        _ensure_qwen(qwen_model)
-        opts_str = ", ".join(options)
-        prompt = (
-            f"This image shows a row of checkboxes from an archaeological form. "
-            f"The options are: {opts_str}. "
-            f"List only the options that have a tick, cross, or mark inside their box. "
-            f"Return a comma-separated list, or the word NONE if nothing is ticked."
-        )
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": crop},
-                    {"type": "text",  "text": prompt},
-                ],
-            }
-        ]
-        text_input = _QWEN_PROCESSOR.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        image_inputs, video_inputs = process_vision_info(messages)
-        inputs = _QWEN_PROCESSOR(
-            text=[text_input], images=image_inputs, videos=video_inputs,
-            padding=True, return_tensors="pt",
-        ).to(_QWEN_DEVICE)
-        with torch.inference_mode():
-            generated_ids = _QWEN_MODEL.generate(**inputs, max_new_tokens=64, do_sample=False)
-        trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
-        response = _QWEN_PROCESSOR.batch_decode(
-            trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )[0].strip()
-
-        if response.upper() == "NONE" or not response:
-            return []
-        # Match response words against known options (case-insensitive)
-        response_lower = response.lower()
-        return [opt for opt in options if opt.lower() in response_lower]
-
+        return _detect_checkboxes_qwen(crop, options, qwen_model)
     else:
-        # Heuristic for ocrmac / rapidocr
-        raw = ocr_crop(crop, engine, qwen_model)
-        raw_lower = raw.lower()
-        tick_chars = {"✓", "✗", "x", "☑", "■", "✔", "v", "[x]", "[v]"}
-        ticked = []
-        for opt in options:
-            if opt.lower() in raw_lower:
-                idx = raw_lower.find(opt.lower())
-                window = raw_lower[max(0, idx - 10): idx + len(opt) + 10]
-                if any(t in window for t in tick_chars):
-                    ticked.append(opt)
-        return ticked if ticked else (["RAW: " + raw] if raw else [])
+        return _detect_checkboxes_by_column_ocr(crop, options, engine, qwen_model)
+
+
+def _detect_checkboxes_by_column_ocr(
+    crop: Image.Image,
+    options: list,
+    engine: str,
+    qwen_model: str,
+) -> list:
+    """Column-slice checkbox detection for ocrmac and rapidocr."""
+    w, h   = crop.size
+    n      = len(options)
+    ticked = []
+    tick_chars = {"✓", "✗", "x", "☑", "■", "✔", "v", "[x]", "[v]"}
+
+    for i, opt in enumerate(options):
+        x0 = int(i * w / n)
+        x1 = int((i + 1) * w / n)
+        slice_crop = crop.crop((x0, 0, x1, h))
+        raw = ocr_crop(slice_crop, engine, qwen_model).lower()
+        if any(t in raw for t in tick_chars):
+            ticked.append(opt)
+
+    return ticked
+
+
+def _detect_checkboxes_qwen(
+    crop: Image.Image,
+    options: list,
+    qwen_model: str,
+) -> list:
+    """Qwen-based checkbox detection via structured prompt."""
+    import torch
+    from qwen_vl_utils import process_vision_info
+
+    _ensure_qwen(qwen_model)
+
+    opts_str = ", ".join(options)
+    prompt = (
+        f"This image shows a row of checkboxes from an archaeological form. "
+        f"The options in left-to-right order are: {opts_str}. "
+        f"List only the options that have a clear tick, cross, or mark inside their box. "
+        f"If you are not certain whether a mark is intentional, do not include that option. "
+        f"Return a comma-separated list, or the single word NONE if nothing is ticked."
+    )
+    messages = [{"role": "user", "content": [
+        {"type": "image", "image": crop},
+        {"type": "text",  "text": prompt},
+    ]}]
+
+    text_input = _QWEN_PROCESSOR.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = _QWEN_PROCESSOR(
+        text=[text_input], images=image_inputs, videos=video_inputs,
+        padding=True, return_tensors="pt",
+    ).to(_QWEN_DEVICE)
+
+    with torch.inference_mode():
+        generated_ids = _QWEN_MODEL.generate(
+            **inputs, max_new_tokens=64, do_sample=False,
+        )
+
+    trimmed  = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated_ids)]
+    response = _QWEN_PROCESSOR.batch_decode(
+        trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )[0].strip()
+
+    if response.upper() == "NONE" or not response:
+        return []
+    response_lower = response.lower()
+    return [opt for opt in options if opt.lower() in response_lower]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Above-note extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_above_note(raw_text: str) -> str:
+    """
+    Extract the context number from an 'above_note_roi' OCR result.
+
+    Recorders write a context number in the sub-row beneath 'Above' and annotate
+    it 'This context', indicating stratigraphic self-equality (a standard Harris
+    Matrix convention). Strip template noise and return the digit sequence only.
+    """
+    if not raw_text.strip():
+        return ""
+    digits = re.sub(r"\D", "", raw_text)
+    return digits if digits else raw_text.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Numeric field confidence flagging
+# ─────────────────────────────────────────────────────────────────────────────
+
+def flag_numeric_uncertainty(record: dict) -> dict:
+    """
+    Flag numeric fields whose OCR result looks suspicious.
+
+    Archaeological context numbers are 4-digit integers. Any value that contains
+    non-digit characters (or is unexpectedly short) is marked with a low-confidence
+    companion key so downstream reviewers can check against the physical record.
+
+    Common OCR digit confusions: 8/9, 5/6, 0/O, 1/l.
+    """
+    for field in NUMERIC_FIELDS:
+        val = record.get(field, "").strip()
+        if val and not re.fullmatch(r"\d{4}", val):
+            record[f"_{field}_confidence"] = "low — verify against physical record"
+    return record
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -437,44 +484,66 @@ def parse_record(
     debug_crops: bool = False,
 ) -> dict:
     """Parse one completed context record form and return a structured dict."""
-    print(f"[parse] Loading '{note_path.name}' …")
+    print(f"[parse] Loading '{note_path.name}' ...")
     img = load_image(note_path, device)
-    print(f"[parse] Canvas size: {img.size}  |  engine: {engine}")
+    print(f"[parse] Canvas: {img.size}  |  engine: {engine}")
 
     if engine == "qwen":
         print(f"[parse] Qwen model: {QWEN_MODELS[qwen_model]}")
-        _ensure_qwen(qwen_model)   # load once before the field loop
+        _ensure_qwen(qwen_model)
 
-    debug_dir = note_path.parent / f"{note_path.stem}_debug_crops"
+    debug_dir = None
     if debug_crops:
+        debug_dir = note_path.parent / f"{note_path.stem}_debug_crops"
         debug_dir.mkdir(exist_ok=True)
         print(f"[parse] Debug crops → {debug_dir}/")
 
     record = {
         "_source_file": str(note_path.name),
-        "_device": device,
-        "_engine": engine,
+        "_device":      device,
+        "_engine":      engine,
     }
+
+    above_note_raw = ""
 
     for field_key, meta in FIELD_REGIONS.items():
         roi   = meta["roi"]
         ftype = meta["type"]
         crop  = crop_roi(img, roi, device)
 
-        if debug_crops:
+        if debug_dir is not None:
             crop.save(str(debug_dir / f"{field_key}.png"))
 
-        print(f"  [{field_key}] …", end=" ", flush=True)
+        print(f"  [{field_key}] ...", end=" ", flush=True)
 
-        if ftype == "text":
+        if ftype == "above_note_roi":
+            # Not a top-level output field — capture raw text for later processing
+            above_note_raw = ocr_crop(crop, engine, qwen_model)
+            print(f"→ (above_note raw: {above_note_raw!r})")
+            continue
+
+        elif ftype == "text":
             value = ocr_crop(crop, engine, qwen_model)
+
         elif ftype == "checkbox_group":
-            value = detect_checkboxes(crop, meta.get("options", []), engine, qwen_model)
+            value = detect_checkboxes_by_column(
+                crop, meta.get("options", []), engine, qwen_model
+            )
+
         else:
             value = ocr_crop(crop, engine, qwen_model)
 
         record[field_key] = value
-        print(f"→ {str(value)[:60].replace(chr(10), ' ')!r}")
+        print(f"→ {str(value)[:80].replace(chr(10), ' ')!r}")
+
+    # Attach above_note as a properly scoped field (not a peer of above/below)
+    above_note = extract_above_note(above_note_raw)
+    if above_note:
+        record["above_note"] = above_note
+        print(f"  [above_note] → {above_note!r}  (stratigraphic self-equality annotation)")
+
+    # Flag suspicious numeric fields
+    record = flag_numeric_uncertainty(record)
 
     return record
 
@@ -490,52 +559,83 @@ def save_json(record: dict, out_path: Path) -> None:
 
 
 def save_csv(record: dict, out_path: Path) -> None:
-    headers  = ["Source File", "Device", "Engine"] + [m["label"] for m in FIELD_REGIONS.values()]
-    row_keys = ["_source_file", "_device", "_engine"] + list(FIELD_REGIONS.keys())
+    """
+    Append one record row to the batch CSV.
+
+    Detects schema mismatches between the current FIELD_REGIONS and an
+    existing CSV file (e.g. if a field was added mid-project), and warns
+    the user rather than silently producing misaligned columns.
+    """
+    all_keys   = CSV_METADATA_KEYS   + CSV_FIELD_KEYS
+    all_labels = CSV_METADATA_LABELS + CSV_FIELD_LABELS
+
+    file_exists = out_path.exists()
+
+    if file_exists:
+        with open(out_path, "r", encoding="utf-8") as f:
+            reader       = csv.reader(f)
+            existing_hdr = next(reader, [])
+        if existing_hdr and existing_hdr != all_labels:
+            print(
+                f"WARNING: CSV schema mismatch in {out_path}.\n"
+                f"  Existing : {existing_hdr}\n"
+                f"  Current  : {all_labels}\n"
+                f"  Use --outdir to write a fresh file, or manually delete the CSV."
+            )
+
     row = []
-    for k in row_keys:
+    for k in all_keys:
         v = record.get(k, "")
         if isinstance(v, list):
             v = "; ".join(v)
+        elif isinstance(v, dict):
+            v = json.dumps(v)
         row.append(v)
-    file_exists = out_path.exists()
+
     with open(out_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(headers)
+            writer.writerow(all_labels)
         writer.writerow(row)
+
     print(f"[output] CSV  → {out_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI
+# Engine auto-detection
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _default_engine() -> str:
-    """Pick a sensible default engine based on platform and what's installed."""
+    """Pick a sensible default engine based on platform and installed packages."""
     if platform.system() == "Darwin":
         try:
             from ocrmac import ocrmac  # noqa: F401
             return "ocrmac"
         except ImportError:
             pass
+    # Non-Mac, or ocrmac unavailable on Mac
     try:
         from rapidocr import RapidOCR  # noqa: F401
         return "rapidocr"
     except ImportError:
         pass
-    return "ocrmac"  # let the import error surface with a helpful message
+    # Last resort: qwen will produce a helpful ImportError at first call
+    return "qwen"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Parse completed Supernote context-record .note files to JSON/CSV.",
+        description="Parse completed Supernote context-record forms to JSON/CSV.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Engine install commands
 -----------------------
-  ocrmac    (macOS only)   pip install ocrmac
-  rapidocr  (cross-platform)  pip install rapidocr onnxruntime
+  ocrmac    (macOS only)       pip install ocrmac
+  rapidocr  (cross-platform)   pip install rapidocr onnxruntime
   qwen      (all platforms, best accuracy, needs RAM)
             pip install git+https://github.com/huggingface/transformers
             pip install torch accelerate qwen-vl-utils
@@ -552,46 +652,31 @@ Qwen model sizes
         help="Path to a .note file, a rasterised PNG, or a folder (with --batch).",
     )
     parser.add_argument(
-        "--engine",
-        choices=ENGINES,
-        default=None,
-        help=(
-            "OCR engine to use. "
-            "Auto-detected if omitted (ocrmac on Mac, rapidocr elsewhere)."
-        ),
+        "--engine", choices=ENGINES, default=None,
+        help="OCR engine. Auto-detected if omitted (ocrmac on Mac, rapidocr elsewhere).",
     )
     parser.add_argument(
-        "--qwen-model",
-        choices=list(QWEN_MODELS),
-        default="3B",
-        metavar="SIZE",
+        "--qwen-model", choices=list(QWEN_MODELS), default="3B", metavar="SIZE",
         help="Qwen model size (3B / 7B / 72B). Only used with --engine qwen. Default: 3B.",
     )
     parser.add_argument(
-        "--batch",
-        action="store_true",
+        "--batch", action="store_true",
         help="Process all .note files found in the input folder.",
     )
     parser.add_argument(
-        "--device",
-        choices=list(CANVAS),
-        default="nomad",
+        "--device", choices=list(CANVAS), default="nomad",
         help="Supernote device model (affects canvas dimensions). Default: nomad.",
     )
     parser.add_argument(
-        "--format",
-        choices=["json", "csv", "both"],
-        default="both",
+        "--format", choices=["json", "csv", "both"], default="both",
         help="Output format. Default: both.",
     )
     parser.add_argument(
-        "--outdir",
-        default=None,
+        "--outdir", default=None,
         help="Directory to write output files (default: same as input).",
     )
     parser.add_argument(
-        "--debug-crops",
-        action="store_true",
+        "--debug-crops", action="store_true",
         help="Save each field's cropped image for ROI debugging.",
     )
     args = parser.parse_args()
@@ -601,7 +686,8 @@ Qwen model sizes
     input_path = Path(args.input)
     outdir     = Path(args.outdir) if args.outdir else None
 
-    print(f"Engine: {engine}" + (f" ({QWEN_MODELS[qwen_model]})" if engine == "qwen" else ""))
+    print(f"Engine: {engine}"
+          + (f" ({QWEN_MODELS[qwen_model]})" if engine == "qwen" else ""))
 
     def run_one(note_path: Path, batch_csv: Path) -> None:
         record = parse_record(
@@ -620,7 +706,8 @@ Qwen model sizes
 
     if args.batch:
         if not input_path.is_dir():
-            print(f"ERROR: --batch requires a directory, got: {input_path}", file=sys.stderr)
+            print(f"ERROR: --batch requires a directory, got: {input_path}",
+                  file=sys.stderr)
             sys.exit(1)
         note_files = sorted(input_path.glob("*.note"))
         if not note_files:
